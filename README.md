@@ -14,6 +14,10 @@ ESP32 ⇄ USB(Web Serial)⇄ ブリッジのタブ(Chrome/Edge)⇄ Colab の pro
 
 ## 使い方(学生)
 
+実機テスト用ノートブック: [Colab で開く](https://colab.research.google.com/github/hasevr/esp-bridge/blob/main/esp_bridge_test.ipynb)
+(Google Drive が無効なアカウントでも、GitHub から直接開ける)
+
+
 1. ノートブックのセルで起動する。
    ```python
    !git clone -q https://github.com/hasevr/esp-bridge /content/esp-bridge 2>/dev/null || true
