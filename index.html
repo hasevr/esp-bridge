@@ -1,0 +1,258 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ESP32 ブリッジ</title>
+<style>
+  :root { --bg:#fff; --fg:#1b1b1b; --muted:#666; --line:#ddd; --accent:#1a73e8; --ok:#188038; --ng:#c5221f; --warn:#fef7e0; --mono:#f6f8fa; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#1e1e1e; --fg:#e8e8e8; --muted:#aaa; --line:#444; --accent:#8ab4f8; --ok:#81c995; --ng:#f28b82; --warn:#3c3420; --mono:#111; } }
+  body { margin:0; font:15px/1.5 system-ui,sans-serif; background:var(--bg); color:var(--fg); }
+  header { padding:12px 16px; border-bottom:1px solid var(--line); display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+  h1 { font-size:17px; margin:0 8px 0 0; }
+  button { font:inherit; padding:6px 12px; border-radius:6px; border:1px solid var(--line); background:var(--bg); color:var(--fg); cursor:pointer; }
+  button.primary { background:var(--accent); color:#fff; border-color:var(--accent); }
+  button:disabled { opacity:.5; cursor:default; }
+  .pill { padding:2px 10px; border-radius:99px; font-size:13px; border:1px solid var(--line); }
+  .pill.ok { color:var(--ok); border-color:var(--ok); } .pill.ng { color:var(--ng); border-color:var(--ng); }
+  main { padding:12px 16px; display:grid; gap:12px; }
+  #confirm { display:none; background:var(--warn); border:1px solid var(--line); border-radius:8px; padding:12px; }
+  #progress { height:6px; background:var(--line); border-radius:3px; overflow:hidden; display:none; }
+  #progress > div { height:100%; width:0; background:var(--accent); transition:width .2s; }
+  #log { background:var(--mono); border:1px solid var(--line); border-radius:8px; padding:8px; height:55vh; overflow:auto; font:12px/1.4 ui-monospace,monospace; white-space:pre-wrap; margin:0; }
+  #events { font-size:13px; color:var(--muted); max-height:8em; overflow:auto; }
+  label { font-size:14px; }
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  input[type=text] { font:inherit; padding:5px 8px; border:1px solid var(--line); border-radius:6px; background:var(--bg); color:var(--fg); min-width:12em; flex:1; }
+</style>
+</head>
+<body>
+<header>
+  <h1>ESP32 ブリッジ</h1>
+  <span id="bridge" class="pill">Colab: 確認中</span>
+  <span id="dev" class="pill">ESP32: 未接続</span>
+  <button id="connect" class="primary">ESP32 に接続</button>
+  <button id="reset" disabled>リセット</button>
+  <label><input type="checkbox" id="ask" checked> 書き込み前に確認する</label>
+</header>
+<main>
+  <div id="confirm">
+    <div id="confirmText"></div>
+    <div class="row" style="margin-top:8px"><button id="yes" class="primary">書き込む</button><button id="no">拒否</button></div>
+  </div>
+  <div id="progress"><div></div></div>
+  <div class="row"><input type="text" id="sendText" placeholder="ESP32 に送る文字(Enter で送信)"><button id="send" disabled>送信</button><button id="clear">表示を消去</button></div>
+  <pre id="log"></pre>
+  <div id="events"></div>
+</main>
+<script type="module">
+import { ESPLoader, Transport } from 'https://cdn.jsdelivr.net/npm/esptool-js@0.7.0/bundle.js';
+
+const $ = id => document.getElementById(id);
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const BAUD = 115200;
+let port = null, reader = null, monitoring = false, busy = false;
+
+function event(msg, cls) {
+  const d = document.createElement('div');
+  d.textContent = new Date().toLocaleTimeString() + '  ' + msg;
+  if (cls) d.style.color = `var(--${cls})`;
+  $('events').prepend(d);
+}
+function show(text) {
+  const log = $('log'), atBottom = log.scrollTop + log.clientHeight >= log.scrollHeight - 20;
+  log.textContent += text;
+  if (log.textContent.length > 200000) log.textContent = log.textContent.slice(-150000);
+  if (atBottom) log.scrollTop = log.scrollHeight;
+}
+function setDev(ok, text) { const e = $('dev'); e.textContent = 'ESP32: ' + text; e.className = 'pill ' + (ok ? 'ok' : 'ng'); }
+async function post(path, data, text) {
+  return fetch(path, { method: 'POST', body: text ?? JSON.stringify(data), headers: { 'Content-Type': text ? 'text/plain' : 'application/json' } });
+}
+async function status(extra = {}) {
+  try {
+    const r = await post('api/status', { connected: !!port && monitoring, busy, fake: FAKE, ...extra });
+    if (r.ok) { $('bridge').textContent = 'Colab: 接続中'; $('bridge').className = 'pill ok'; }
+  } catch {}
+}
+
+// ---- ?fake=1: 実機なしで試すための偽の ESP32(エコーと定期出力だけ)
+const FAKE = new URLSearchParams(location.search).has('fake');
+class FakePort {
+  constructor() { this.readable = null; this.writable = null; this.q = null; }
+  getInfo() { return { usbVendorId: 0x10c4, usbProductId: 0xea60 }; }
+  emit(s) { this.q?.enqueue(new TextEncoder().encode(s)); }
+  async open() {
+    let timer;
+    this.readable = new ReadableStream({
+      start: c => { this.q = c; let n = 0; timer = setInterval(() => this.emit(`I (${++n * 1000}) H_FUNC: ADC:${1900 + (n * 37) % 200}\r\n`), 1000); },
+      cancel: () => { clearInterval(timer); this.q = null; },
+    });
+    this.writable = new WritableStream({ write: chunk => this.emit('echo: ' + new TextDecoder().decode(chunk).trim() + '\r\n') });
+    this.emit('rst:0x1 (POWERON_RESET),boot:0x13 (SPI_FAST_FLASH_BOOT)\r\n');
+  }
+  async close() { this.readable = this.writable = null; }
+  async setSignals(sig) { if (sig.requestToSend === false) this.emit('ets Jul 29 2019 12:21:46\r\nrst:0x1 (POWERON_RESET)\r\n'); }
+}
+
+// ---- シリアルモニタ(行単位で Colab に送る)
+let pending = '', sendBuf = [];
+async function startMonitor() {
+  if (!port || monitoring) return;
+  await port.open({ baudRate: BAUD });
+  monitoring = true; setDev(true, '接続中'); $('reset').disabled = $('send').disabled = false; status();
+  const dec = new TextDecoder();
+  (async () => {
+    while (monitoring && port.readable) {
+      reader = port.readable.getReader();
+      try {
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          const s = dec.decode(value, { stream: true });
+          show(s);
+          pending += s;
+          const parts = pending.split(/\r?\n/);
+          pending = parts.pop();
+          sendBuf.push(...parts);
+        }
+      } catch (e) { if (monitoring) event('読み取りエラー: ' + e.message, 'ng'); }
+      finally { reader.releaseLock(); reader = null; }
+    }
+  })();
+}
+async function stopMonitor() {
+  monitoring = false;
+  if (reader) { await reader.cancel().catch(() => {}); }
+  for (let i = 0; i < 20 && reader; i++) await sleep(50);
+  if (port) await port.close().catch(() => {});
+  $('reset').disabled = $('send').disabled = true;
+}
+setInterval(() => {                       // ログをまとめて送る
+  if (!sendBuf.length) return;
+  const lines = sendBuf.splice(0); post('api/log', null, lines.join('\n')).catch(() => {});
+}, 300);
+
+async function resetBoard() {
+  // DevKitC: RTS→EN(反転)、DTR→IO0(反転)。EN を一瞬 Low にして通常起動
+  await port.setSignals({ dataTerminalReady: false, requestToSend: true });
+  await sleep(120);
+  await port.setSignals({ dataTerminalReady: false, requestToSend: false });
+}
+
+// ---- 書き込み
+function askUser(text) {
+  if (!$('ask').checked) return Promise.resolve(true);
+  return new Promise(res => {
+    $('confirmText').textContent = text; $('confirm').style.display = 'block';
+    const done = v => { $('confirm').style.display = 'none'; $('yes').onclick = $('no').onclick = null; res(v); };
+    $('yes').onclick = () => done(true); $('no').onclick = () => done(false);
+  });
+}
+async function flash(cmd) {
+  if (!await askUser(`Colab から書き込みの要求: ${cmd.name}(${cmd.size.toLocaleString()} バイト)。モータなどが動いても安全な状態ですか?`))
+    return { ok: false, msg: 'タブで拒否されました' };
+  const t0 = performance.now();
+  const data = new Uint8Array(await (await fetch('fw?id=' + encodeURIComponent(cmd.id))).arrayBuffer());
+  if (FAKE) {
+    await stopMonitor(); await sleep(500); await startMonitor();
+    const sum = data.reduce((a, b) => (a + b) % 65536, 0);
+    return { ok: true, msg: `(偽の書き込み)${data.length} バイト受信、チェックサム ${sum}、先頭 ${data[0].toString(16)} / 0x1000 ${data[0x1000]?.toString(16)}` };
+  }
+  await stopMonitor();
+  setDev(true, '書き込み中'); busy = true; status();
+  $('progress').style.display = 'block';
+  const bar = $('progress').firstElementChild;
+  const transport = new Transport(port, false);
+  const terminal = { clean() {}, writeLine: s => show('[esptool] ' + s + '\n'), write: s => show(s) };
+  try {
+    const loader = new ESPLoader({ transport, baudrate: 460800, romBaudrate: BAUD, terminal });
+    const chip = await loader.main();
+    await loader.writeFlash({
+      fileArray: [{ data, address: 0 }], flashMode: 'keep', flashFreq: 'keep', flashSize: 'keep',
+      eraseAll: false, compress: true,
+      reportProgress: (_i, w, t) => { bar.style.width = (100 * w / t).toFixed(1) + '%'; },
+    });
+    await loader.after('hard_reset');
+    await transport.disconnect();
+    return { ok: true, msg: `${chip} に ${data.length} バイト、${((performance.now() - t0) / 1000).toFixed(1)} 秒` };
+  } catch (e) {
+    await transport.disconnect().catch(() => {});
+    return { ok: false, msg: '書き込みエラー: ' + (e.message || e) + '(ボードの BOOT ボタンを押しながら再試行すると通ることがあります)' };
+  } finally {
+    busy = false; $('progress').style.display = 'none'; bar.style.width = '0';
+    await startMonitor().catch(e => event('モニタ再開に失敗: ' + e.message, 'ng'));
+  }
+}
+
+async function handle(cmd) {
+  if (!port) return { ok: false, msg: 'タブで ESP32 が選ばれていません' };
+  if (cmd.op === 'flash') return flash(cmd);
+  if (!monitoring) await startMonitor();
+  if (cmd.op === 'reset') { await resetBoard(); return { ok: true, msg: 'リセットしました' }; }
+  if (cmd.op === 'send') {
+    const w = port.writable.getWriter();
+    try { await w.write(new TextEncoder().encode(cmd.text)); } finally { w.releaseLock(); }
+    return { ok: true, msg: `${cmd.text.length} 文字送信` };
+  }
+  return { ok: false, msg: '不明な命令: ' + cmd.op };
+}
+
+// ---- Colab からの命令を待つ
+async function pollLoop() {
+  for (;;) {
+    try {
+      const r = await fetch('api/next?timeout=20');
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      $('bridge').textContent = 'Colab: 接続中'; $('bridge').className = 'pill ok';
+      const cmd = await r.json();
+      if (!cmd.op) continue;
+      event(`命令: ${cmd.op}`);
+      let res;
+      try { res = await handle(cmd); } catch (e) { res = { ok: false, msg: String(e.message || e) }; }
+      event(`${cmd.op}: ${res.msg}`, res.ok ? 'ok' : 'ng');
+      await post('api/done', { id: cmd.id, op: cmd.op, ...res });
+    } catch (e) {
+      $('bridge').textContent = 'Colab: 切断(再接続中)'; $('bridge').className = 'pill ng';
+      await sleep(3000);
+    }
+  }
+}
+
+// ---- 接続
+async function usePort(p) {
+  port = p;
+  const i = p.getInfo();
+  event(`ポート: VID ${i.usbVendorId?.toString(16) ?? '?'} PID ${i.usbProductId?.toString(16) ?? '?'}`);
+  await startMonitor();
+}
+$('connect').onclick = async () => {
+  try {
+    if (monitoring) await stopMonitor();
+    await usePort(await navigator.serial.requestPort());
+  } catch (e) { event('接続できません: ' + e.message, 'ng'); setDev(false, '未接続'); }
+};
+$('reset').onclick = () => resetBoard().then(() => event('リセット'));
+const sendNow = async () => { const t = $('sendText').value; if (!t) return; await handle({ op: 'send', text: t + '\n' }); $('sendText').value = ''; };
+$('send').onclick = sendNow;
+$('sendText').onkeydown = e => { if (e.key === 'Enter') sendNow(); };
+$('clear').onclick = () => { $('log').textContent = ''; };
+navigator.serial?.addEventListener('disconnect', e => { if (e.target === port) { monitoring = false; setDev(false, '抜かれました'); status(); } });
+setInterval(status, 10000);
+
+if (FAKE) {
+  event('偽の ESP32 モード(?fake=1)', 'warn');
+  usePort(new FakePort());
+} else if (!('serial' in navigator)) {
+  setDev(false, 'このブラウザは非対応(Chrome か Edge を使ってください)');
+  $('connect').disabled = true;
+} else {
+  // 以前に許可したポートが1つだけなら自動で使う
+  const ps = await navigator.serial.getPorts();
+  if (ps.length === 1) usePort(ps[0]).catch(e => event('自動接続できません: ' + e.message + '(「ESP32 に接続」を押してください)', 'ng'));
+}
+status();
+pollLoop();
+</script>
+</body>
+</html>
