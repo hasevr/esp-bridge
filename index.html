@@ -59,11 +59,20 @@ function event(msg, cls) {
   if (cls) d.style.color = `var(--${cls})`;
   $('events').prepend(d);
 }
+// 画面への表示は1フレームに1回まとめて行う(受信のたびに長い文字列を書き換えると遅く、受信が追いつかなくなる)
+let showBuf = '', showQueued = false;
 function show(text) {
-  const log = $('log'), atBottom = log.scrollTop + log.clientHeight >= log.scrollHeight - 20;
-  log.textContent += text;
-  if (log.textContent.length > 200000) log.textContent = log.textContent.slice(-150000);
-  if (atBottom) log.scrollTop = log.scrollHeight;
+  showBuf += text;
+  if (showQueued) return;
+  showQueued = true;
+  requestAnimationFrame(() => {
+    showQueued = false;
+    const log = $('log'), atBottom = log.scrollTop + log.clientHeight >= log.scrollHeight - 20;
+    let t = log.textContent + showBuf; showBuf = '';
+    if (t.length > 200000) t = t.slice(-150000);
+    log.textContent = t;
+    if (atBottom) log.scrollTop = log.scrollHeight;
+  });
 }
 function setDev(ok, text) { const e = $('dev'); e.textContent = 'ESP32: ' + text; e.className = 'pill ' + (ok ? 'ok' : 'ng'); }
 async function post(path, data, text) {
@@ -99,7 +108,8 @@ class FakePort {
 let pending = '', sendBuf = [];
 async function startMonitor() {
   if (!port || monitoring) return;
-  await port.open({ baudRate: BAUD });
+  // bufferSize: ブラウザ側の受信バッファ(既定 255 バイト)。起動時のログなどで溢れると Buffer overrun になる
+  await port.open({ baudRate: BAUD, bufferSize: 1 << 16 });
   monitoring = true; setDev(true, '接続中'); $('reset').disabled = $('send').disabled = false; status();
   const dec = new TextDecoder();
   (async () => {
@@ -116,7 +126,10 @@ async function startMonitor() {
           pending = parts.pop();
           sendBuf.push(...parts);
         }
-      } catch (e) { if (monitoring) event('読み取りエラー: ' + e.message, 'ng'); }
+      } catch (e) {
+        // Buffer overrun は一部の文字が欠けただけで、次の読み取りで続きを受け取れる
+        if (monitoring) event(e.name === 'BufferOverrunError' ? '受信が追いつかず一部の文字が欠けました(続けて受信します)' : '読み取りエラー: ' + e.message, 'ng');
+      }
       finally { reader.releaseLock(); reader = null; }
     }
   })();
